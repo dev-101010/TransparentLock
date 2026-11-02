@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to rebuild and upload the exe to (e.g. v2.0.0). Leave empty for a plain build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # For a manual rebuild of a release, build exactly the tagged source
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Build
+        run: dotnet build TransparentLock.sln -c Release
+
+      - name: Check version
+        id: version
+        shell: pwsh
+        run: |
+          $exe = 'TransparentLock/bin/Release/net48/TransparentLock.exe'
+          $version = (Get-Item $exe).VersionInfo.FileVersion
+          Write-Host "File version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          $tag = '${{ inputs.release_tag }}'
+          if (-not $tag -and '${{ github.ref_type }}' -eq 'tag') { $tag = '${{ github.ref_name }}' }
+
+          if ($tag) {
+            # Tag v2.0.0 must match file version 2.0.0.x
+            $expected = $tag.TrimStart('v')
+            if (-not $version.StartsWith("$expected.") -and $version -ne $expected) {
+              Write-Error "Tag $tag does not match file version $version"
+              exit 1
+            }
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TransparentLock-${{ steps.version.outputs.version }}
+          path: TransparentLock/bin/Release/net48/TransparentLock.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: TransparentLock-*
+          merge-multiple: true
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" TransparentLock.exe --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" TransparentLock.exe --title "TransparentLock ${TAG#v}" --generate-notes -R "$GITHUB_REPOSITORY"
+          fi
